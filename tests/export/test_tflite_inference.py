@@ -219,7 +219,7 @@ class TestRunInference:
         assert len(dets) >= 1
 
     def test_detections_below_threshold_filtered(self, rgb_image: Path) -> None:
-        """No detections survive when all logits are zero (uniform probs < 0.3)."""
+        """No detections survive when all logits are very negative (sigmoid≈0.0001 < threshold 0.3)."""
         interp = _make_interp(logits=_make_logits(high_conf_idx=None))
         dets, _ = _run_inference(interp, rgb_image, threshold=0.3)
         assert len(dets) == 0

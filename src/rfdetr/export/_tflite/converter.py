@@ -43,9 +43,8 @@ calibration images via *calibration_data*.  Accepted formats:
 * A :class:`numpy.ndarray` with the same constraints.
 
 Pixel values must be in ``[0, 1]`` (divided by 255 but **not**
-ImageNet-normalized — the converter applies ImageNet normalization
-automatically via ``onnx2tf``'s default ``quant_norm_mean`` /
-``quant_norm_std`` parameters).
+ImageNet-normalized — the converter normalises to ImageNet statistics
+internally before passing the data to ``onnx2tf``).
 
 If no calibration data is provided, random noise is used instead and a
 warning is emitted.  This is sufficient for ``fp32`` / ``fp16`` conversion
@@ -84,6 +83,22 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", 
 
 # Default number of images to sample from a directory for calibration.
 _DEFAULT_DIR_CALIB_SAMPLES: int = 100
+
+_IMAGENET_MEAN: NDArray[np.float32] = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD: NDArray[np.float32] = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _imagenet_normalize(calib: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Normalize NHWC calibration data from [0, 1] to ImageNet statistics.
+
+    Args:
+        calib: Float32 array of shape ``(N, H, W, C)`` with values in ``[0, 1]``.
+
+    Returns:
+        Float32 array of the same shape with ImageNet-normalised values
+        (approximately ``[-2.1, 2.6]``).
+    """
+    return (calib - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
 def _check_onnx2tf_available() -> None:
@@ -306,7 +321,9 @@ def _prepare_calibration_data(
             calibration data formats.
 
     Returns:
-        Path to the ``.npy`` calibration data file.
+        Path to the ``.npy`` calibration data file containing an NHWC
+        ``float32`` array with ImageNet-normalised pixel values
+        (approximately ``[-2.1, 2.6]``).
 
     Raises:
         FileNotFoundError: If *calibration_data* is a path that does not
@@ -323,14 +340,16 @@ def _prepare_calibration_data(
         _, input_dims = _get_onnx_input_info(onnx_path)
         # input_dims is NCHW, e.g. [1, 3, 384, 384].
         _, c, h, w = input_dims
-        # NHWC, float32, [0, 1] range — onnx2tf applies ImageNet norm.
+        # NHWC, float32, [0, 1] range — normalised to ImageNet stats below.
         calib = np.random.rand(_DEFAULT_CALIB_SAMPLES, h, w, c).astype(np.float32)
+        calib = _imagenet_normalize(calib)
         npy_path = output_dir / "_rfdetr_calib_data.npy"
         np.save(str(npy_path), calib)
         logger.debug(f"Generated random calibration data: shape={calib.shape}, saved to {npy_path}")
     elif isinstance(calibration_data, np.ndarray):
         npy_path = output_dir / "_rfdetr_calib_data.npy"
-        np.save(str(npy_path), calibration_data)
+        norm_calib = _imagenet_normalize(calibration_data.astype(np.float32, copy=False))
+        np.save(str(npy_path), norm_calib)
         logger.info(f"Using provided calibration array: shape={calibration_data.shape}")
     else:
         data_path = Path(calibration_data)
@@ -339,12 +358,15 @@ def _prepare_calibration_data(
             _, input_dims = _get_onnx_input_info(onnx_path)
             _, _c, h, w = input_dims
             calib = _load_calibration_images(data_path, height=h, width=w, max_images=max_images)
+            calib = _imagenet_normalize(calib)
             npy_path = output_dir / "_rfdetr_calib_data.npy"
             np.save(str(npy_path), calib)
             logger.info(f"Prepared calibration data from image directory: shape={calib.shape}, saved to {npy_path}")
         elif data_path.is_file():
-            npy_path = data_path
-            logger.info(f"Using calibration data from: {npy_path}")
+            npy_path = output_dir / "_rfdetr_calib_data.npy"
+            _loaded = np.load(str(data_path), allow_pickle=False).astype(np.float32, copy=False)
+            np.save(str(npy_path), _imagenet_normalize(_loaded))
+            logger.info(f"Using calibration data from: {data_path}")
         else:
             raise FileNotFoundError(f"Calibration data path not found: {data_path}")
 
