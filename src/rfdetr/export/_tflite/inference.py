@@ -76,15 +76,34 @@ def _run_inference(
     decodes the ``dets`` / ``labels`` output tensors into a
     :class:`supervision.Detections` object with pixel-space ``xyxy`` boxes.
 
+    **Input contract** (must match ``RFDETR.predict()`` preprocessing exactly):
+
+    - Image is opened as-is and converted to ``"RGB"`` (3-channel) or ``"L"``
+      (1-channel greyscale) depending on the model's channel count.
+    - Resize uses ``PIL.Image.Resampling.BILINEAR`` — matching
+      ``torchvision.transforms.functional.resize()`` which defaults to
+      ``InterpolationMode.BILINEAR``.  Using PIL's default (``BICUBIC``) would
+      produce slightly different pixel values and can degrade confidence.
+    - Pixel values are scaled to ``[0, 1]`` then normalised with ImageNet
+      statistics: ``mean=[0.485, 0.456, 0.406]``, ``std=[0.229, 0.224, 0.225]``.
+    - The tensor is fed as ``[1, H, W, C]`` (NHWC) because onnx2tf transposes
+      ONNX's NCHW layout to NHWC at export time.
+
     Args:
         interp: Allocated TFLite interpreter returned by ``_create_interpreter``.
         image_path: Path to the input image (any format supported by Pillow).
+            RGB images are used as-is; RGBA / palette images are converted.
         threshold: Confidence threshold; detections below this are discarded.
 
     Returns:
         A tuple of ``(detections, pil_img)`` where ``detections`` contains
         pixel-space ``xyxy`` boxes and ``pil_img`` is the original PIL image
         at its original resolution.
+
+    Examples:
+        >>> interp = _create_interpreter("model_float32.tflite")  # doctest: +SKIP
+        >>> dets, img = _run_inference(interp, "photo.jpg", threshold=0.3)  # doctest: +SKIP
+        >>> print(dets.confidence)  # doctest: +SKIP
     """
     inp_det = interp.get_input_details()
     out_det = interp.get_output_details()
@@ -105,7 +124,16 @@ def _run_inference(
 
     pil_img = PILImage.open(image_path)
     pil_mode = "L" if channels == 1 else "RGB"
-    arr = np.array(pil_img.convert(pil_mode).resize((width, height)), dtype=np.float32) / 255.0
+    # Use BILINEAR resampling to match torchvision.transforms.functional.resize()
+    # which defaults to InterpolationMode.BILINEAR.  PIL's default (None → BICUBIC)
+    # produces different pixel values and can cause a measurable confidence drop.
+    arr = (
+        np.array(
+            pil_img.convert(pil_mode).resize((width, height), PILImage.Resampling.BILINEAR),
+            dtype=np.float32,
+        )
+        / 255.0
+    )
     if arr.ndim == 2:  # "L" → (height, width); TFLite needs (height, width, 1)
         arr = arr[:, :, np.newaxis]
     inp_tensor = (arr - mean) / std
@@ -124,8 +152,10 @@ def _run_inference(
         # matching for the detection outputs only: boxes (*, 4) and logits
         # (*, num_classes+1). Segmentation exports may include additional outputs
         # such as masks; unnamed extra outputs are not resolved by this fallback.
-        logger.debug(
-            "Name-based output matching failed (available: %s). Falling back to shape-based matching.",
+        logger.warning(
+            "Name-based TFLite output matching failed (available names: %s). "
+            "onnx2tf may have renamed 'dets'/'labels' to generic 'Identity'/'Identity_N'. "
+            "Falling back to shape-based matching.",
             available_output_names,
         )
         shape_boxes_candidates = [i for i, od in enumerate(out_det) if len(od["shape"]) == 3 and od["shape"][-1] == 4]
@@ -136,7 +166,13 @@ def _run_inference(
         elif len(out_det) == 2:
             # Ambiguous shapes (e.g. num_classes==3 → logits dim==4 == boxes dim).
             # onnx2tf preserves ONNX output order: index 0 = dets (boxes), index 1 = labels (logits).
-            logger.debug("Shape-based matching ambiguous. Using positional order (0=boxes, 1=logits).")
+            logger.warning(
+                "Shape-based TFLite output matching is ambiguous (both outputs have last dim==4, "
+                "which happens when num_classes==3).  Falling back to positional order: "
+                "output 0 = boxes ('dets'), output 1 = logits ('labels').  "
+                "If detections look wrong, inspect output names with _create_interpreter() "
+                "and set LOG_LEVEL=DEBUG."
+            )
             boxes_idx = 0
             logits_idx = 1
         else:
