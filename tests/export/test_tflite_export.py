@@ -34,6 +34,7 @@ from rfdetr.export._tflite.converter import (
     _VALID_QUANTIZATIONS,
     _check_onnx2tf_available,
     _get_onnx_input_info,
+    _imagenet_normalize,
     _load_calibration_images,
     _numpy_allow_pickle,
     _patch_validation_download,
@@ -196,7 +197,7 @@ class TestExportTfliteConverter:
 
         convert_mock.assert_called_once()
         kwargs = convert_mock.call_args.kwargs
-        assert kwargs["input_onnx_file_path"] == str(onnx_model)
+        assert kwargs["input_onnx_file_path"] == str(tflite_output / "_simplified" / onnx_model.name)
         assert kwargs["output_folder_path"] == str(tflite_output)
         assert kwargs["output_signaturedefs"] is True
         assert kwargs["non_verbose"] is True
@@ -724,6 +725,7 @@ class TestPrepareCalibrationData:
             assert "INT8" in mock_logger.warning.call_args[0][0]
 
     def test_ndarray_saves_to_npy(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+        """ndarray input is ImageNet-normalised before saving."""
         onnx_path = tmp_path / "model.onnx"
         onnx_path.write_bytes(b"\x00")
         calib = np.random.rand(10, 256, 256, 3).astype(np.float32)
@@ -731,17 +733,22 @@ class TestPrepareCalibrationData:
         npy_path = _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
 
         loaded = np.load(str(npy_path))
-        np.testing.assert_array_equal(loaded, calib)
+        expected = _imagenet_normalize(calib)
+        np.testing.assert_array_almost_equal(loaded, expected)
 
-    def test_path_string_used_directly(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+    def test_path_string_normalises_and_saves_copy(self, tmp_path: Path, _mock_onnx_info: None) -> None:
+        """A .npy file path is normalised to ImageNet stats and saved as a copy."""
         onnx_path = tmp_path / "model.onnx"
         onnx_path.write_bytes(b"\x00")
+        raw = np.random.rand(5, 256, 256, 3).astype(np.float32)
         npy_file = tmp_path / "my_calib.npy"
-        np.save(str(npy_file), np.zeros((5, 256, 256, 3), dtype=np.float32))
+        np.save(str(npy_file), raw)
 
         npy_path = _prepare_calibration_data(onnx_path, str(npy_file), tmp_path, "fp32")
 
-        assert npy_path == npy_file
+        assert npy_path.is_file()
+        loaded = np.load(str(npy_path))
+        np.testing.assert_array_almost_equal(loaded, _imagenet_normalize(raw))
 
     def test_directory_loads_images(self, tmp_path: Path, _mock_onnx_info: None) -> None:
         """A directory path triggers image loading and .npy creation."""

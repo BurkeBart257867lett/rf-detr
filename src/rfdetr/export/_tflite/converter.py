@@ -101,6 +101,125 @@ def _imagenet_normalize(calib: NDArray[np.float32]) -> NDArray[np.float32]:
     return (calib - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
+def _fold_constant_expands(model: Any) -> Any:
+    """Constant-fold ``Expand`` ops whose inputs are all compile-time constants.
+
+    ``onnx2tf`` 1.26+ fails with ``ValueError: Output tensors of a Functional
+    model must be the output of a TensorFlow Layer`` when an ``Expand`` op's
+    input is a raw constant tensor (e.g. a position-embedding index grid
+    ``[[0][1]...[31]]``) rather than a ``Layer`` output.
+
+    This function targets only ``Expand`` nodes where every input can be
+    resolved to a constant value at graph-build time.  Dynamic ``Expand``
+    nodes (whose shape input depends on model inputs) are left untouched,
+    avoiding the ``Tile`` / ``Concat`` rank-mismatch regressions introduced
+    by running full onnxsim simplification.
+
+    Args:
+        model: An ONNX ``ModelProto`` to patch in place.
+
+    Returns:
+        The same ``ModelProto`` with all-constant ``Expand`` nodes replaced by
+        initializer tensors.
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper
+
+    # Build a map from tensor name → constant numpy value.
+    const_values: dict[str, Any] = {}
+    for init in model.graph.initializer:
+        const_values[init.name] = numpy_helper.to_array(init)
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.name == "value":
+                    const_values[node.output[0]] = numpy_helper.to_array(attr.t)
+
+    nodes_to_remove: list[Any] = []
+    initializers_to_add: list[Any] = []
+    folded = 0
+
+    for node in model.graph.node:
+        if node.op_type != "Expand":
+            continue
+        if not all(inp in const_values for inp in node.input):
+            continue  # at least one dynamic input — leave untouched
+
+        data = const_values[node.input[0]]
+        shape = const_values[node.input[1]].astype(int).tolist()
+        try:
+            folded_value = np.broadcast_to(data, shape).copy()
+        except ValueError:
+            continue  # broadcast not possible — leave untouched
+
+        init_tensor = numpy_helper.from_array(folded_value.astype(data.dtype), name=node.output[0])
+        initializers_to_add.append(init_tensor)
+        const_values[node.output[0]] = folded_value
+        nodes_to_remove.append(node)
+        folded += 1
+
+    for node in nodes_to_remove:
+        model.graph.node.remove(node)
+    for init in initializers_to_add:
+        model.graph.initializer.append(init)
+
+    if folded:
+        logger.debug(f"Constant-folded {folded} all-constant Expand node(s) for onnx2tf compatibility")
+
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        logger.warning(f"ONNX check failed after Expand constant-folding: {exc}")
+
+    return model
+
+
+def _patch_onnx_for_tflite(onnx_path: Path, output_dir: Path) -> Path:
+    """Apply targeted ONNX graph patches to work around ``onnx2tf`` 1.x bugs.
+
+    Known bug in ``onnx2tf`` 1.x affecting RF-DETR's DINOv2 backbone:
+
+    * **Constant Expand failure** — onnx2tf cannot lower an ``Expand`` node
+      whose input is a raw constant tensor (not a ``Layer`` output) into a
+      ``tf_keras.Functional`` model.  Fix: constant-fold all ``Expand`` nodes
+      with fully-constant inputs, replacing them with initializers.
+
+    This is a surgical graph-level patch.  Unlike running ``onnxsim``
+    (full constant propagation), it does not alter the backbone embedding
+    ``Tile`` or ``Concat`` ops, avoiding the rank-mismatch failures that
+    full simplification introduces.
+
+    The patched model is saved to
+    ``output_dir/_simplified/{onnx_path.name}`` so the original is preserved
+    and the stem remains unchanged for downstream ``.tflite`` file-name
+    matching.
+
+    Args:
+        onnx_path: Path to the original ``.onnx`` file.
+        output_dir: Directory where the patched model is cached.
+
+    Returns:
+        Path to the patched ``.onnx`` file, or *onnx_path* unchanged when
+        ``onnx`` is not importable.
+    """
+    try:
+        import onnx
+    except ImportError:
+        logger.debug("onnx not installed — skipping ONNX patching for onnx2tf compatibility")
+        return onnx_path
+
+    model = onnx.load(str(onnx_path))
+    model = _fold_constant_expands(model)
+
+    patched_dir = output_dir / "_simplified"
+    patched_dir.mkdir(parents=True, exist_ok=True)
+    patched_path = patched_dir / onnx_path.name
+    onnx.save(model, str(patched_path))
+    logger.info(f"ONNX patched for onnx2tf: {onnx_path.name} → {patched_path}")
+    return patched_path
+
+
 def _check_onnx2tf_available() -> None:
     """Verify that the ``onnx2tf`` package is importable.
 
@@ -464,13 +583,33 @@ def export_tflite(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Patch the ONNX graph to work around onnx2tf 1.x bugs before conversion.
+    # See _patch_onnx_for_tflite() for details of the two targeted fixes.
+    onnx_path_for_conversion = _patch_onnx_for_tflite(onnx_path, output_dir)
+
     calib_npy_path = _prepare_calibration_data(
         onnx_path, calibration_data, output_dir, quantization, max_images=max_images
     )
 
+    # onnx2tf names output files based on the ONNX model stem.
+    model_stem = onnx_path.stem
+
     logger.info(f"Converting ONNX → TFLite (quantization={quantization!r}, verbosity={verbosity!r}): {onnx_path}")
 
-    try:
+    from onnx2tf import convert
+
+    convert_kwargs: dict[str, Any] = {
+        "input_onnx_file_path": str(onnx_path_for_conversion),
+        "output_folder_path": str(output_dir),
+        "output_signaturedefs": True,
+        "non_verbose": not verbose,
+        "verbosity": verbosity,
+    }
+
+    if quantization == "int8":
+        convert_kwargs["output_integer_quantized_tflite"] = True
+
+    def _run_convert(kwargs: dict[str, Any]) -> None:
         # _patch_validation_download redirects onnx2tf's
         # download_test_image_data() to return our calibration data.
         # onnx2tf uses this data for both ONNX/TF output validation and
@@ -487,31 +626,34 @@ def export_tflite(
         # "/segmentation_head/blocks.2/dwconv/Conv/kernel") that contain
         # leading "/" characters which violate the saved_model naming
         # pattern. Enabling signature defs bypasses this restriction.
-        with (
-            _numpy_allow_pickle(),
-            _patch_validation_download(str(calib_npy_path)),
-        ):
-            from onnx2tf import convert
+        with _numpy_allow_pickle(), _patch_validation_download(str(calib_npy_path)):
+            convert(**kwargs)
 
-            convert_kwargs: dict[str, Any] = {
-                "input_onnx_file_path": str(onnx_path),
-                "output_folder_path": str(output_dir),
-                "output_signaturedefs": True,
-                "non_verbose": not verbose,
-                "verbosity": verbosity,
-            }
+    try:
+        _run_convert(convert_kwargs)
+    except Exception as first_exc:
+        # onnx2tf auto-generates {stem}_auto.json in the output directory when
+        # it encounters ops it cannot convert directly (e.g. TopK with a 1-D
+        # k tensor).  Retrying with param_replacement_file resolves most such
+        # failures without any manual intervention.
+        auto_json_path = output_dir / f"{model_stem}_auto.json"
+        if auto_json_path.is_file():
+            logger.info(
+                f"onnx2tf generated replacement JSON: {auto_json_path.name}. "
+                "Retrying conversion with param_replacement_file..."
+            )
+            try:
+                convert_kwargs["param_replacement_file"] = str(auto_json_path)
+                _run_convert(convert_kwargs)
+            except Exception as retry_exc:
+                logger.error(f"onnx2tf conversion failed (retry with {auto_json_path.name}): {retry_exc}")
+                raise RuntimeError(
+                    f"onnx2tf conversion failed (retry with {auto_json_path.name}): {retry_exc}"
+                ) from retry_exc
+        else:
+            logger.error(f"onnx2tf conversion failed: {first_exc}")
+            raise RuntimeError(f"onnx2tf conversion failed: {first_exc}") from first_exc
 
-            if quantization == "int8":
-                convert_kwargs["output_integer_quantized_tflite"] = True
-
-            convert(**convert_kwargs)
-
-    except Exception as exc:
-        logger.error(f"onnx2tf conversion failed: {exc}")
-        raise RuntimeError(f"onnx2tf conversion failed: {exc}") from exc
-
-    # onnx2tf names output files based on the ONNX model stem.
-    model_stem = onnx_path.stem
     primary = output_dir / f"{model_stem}_float32.tflite"
 
     if not primary.is_file():
