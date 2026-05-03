@@ -1093,3 +1093,98 @@ class TestGridSampleKwargForwarded:
 
         convert_mock.assert_called_once()
         assert convert_mock.call_args.kwargs[test_kwarg] is True
+
+
+# ---------------------------------------------------------------------------
+# TestSkipInt16ActivationQuantization
+# ---------------------------------------------------------------------------
+
+
+class TestSkipInt16ActivationQuantization:
+    """Tests for the int16-activation calibration fast-skip patch."""
+
+    def test_int16_quantize_calls_raise_immediately(self) -> None:
+        """When the patch is active, a _quantize call with int16 activations raises without running the calibrator."""
+        try:
+            import tensorflow as tf
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        with _skip_int16_activation_quantization():
+            from tensorflow.lite.python import lite as _tf_lite
+
+            target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+            with pytest.raises(RuntimeError, match="int16 activations skipped"):
+                # Args are placeholders — the patched method should raise
+                # before touching them.
+                target_cls._quantize(
+                    None,
+                    b"\x00",
+                    tf.int8,
+                    tf.int8,
+                    tf.int16,
+                )
+
+    def test_int8_activations_still_call_through(self) -> None:
+        """The patch must NOT short-circuit non-int16 activation calls."""
+        try:
+            import tensorflow as tf
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from tensorflow.lite.python import lite as _tf_lite
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+        called_with: list = []
+        original = target_cls._quantize
+
+        def _stub(self, model, q_in, q_out, q_act, *a, **k):  # type: ignore[no-untyped-def]
+            called_with.append((q_in, q_out, q_act))
+            return b"stub-model"
+
+        target_cls._quantize = _stub
+        try:
+            with _skip_int16_activation_quantization():
+                result = target_cls._quantize(None, b"\x00", tf.int8, tf.int8, tf.int8)
+            assert result == b"stub-model"
+            assert called_with == [(tf.int8, tf.int8, tf.int8)]
+        finally:
+            target_cls._quantize = original
+
+    def test_patch_restores_original_method(self) -> None:
+        """The original _quantize must be restored after the context exits."""
+        try:
+            from tensorflow.lite.python import lite as _tf_lite
+        except ImportError:
+            pytest.skip("tensorflow not installed")
+
+        from rfdetr.export._tflite.converter import _skip_int16_activation_quantization
+
+        target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+        before = target_cls._quantize
+        with _skip_int16_activation_quantization():
+            assert target_cls._quantize is not before
+        assert target_cls._quantize is before
+
+    def test_no_op_when_tensorflow_not_importable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When TF cannot be imported, the context manager must be a no-op (must not raise)."""
+        import builtins
+
+        from rfdetr.export._tflite import converter as conv_mod
+
+        original_import = builtins.__import__
+
+        def _no_tf(name: str, *a: Any, **k: Any) -> Any:
+            if name.startswith("tensorflow"):
+                raise ImportError("simulated: tensorflow missing")
+            return original_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", _no_tf)
+
+        # Must complete without raising
+        with conv_mod._skip_int16_activation_quantization():
+            pass

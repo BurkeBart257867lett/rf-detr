@@ -649,6 +649,72 @@ def _patch_validation_download(npy_path: str) -> Generator[None, None, None]:
                 setattr(mod, "download_test_image_data", original)
 
 
+@contextlib.contextmanager
+def _skip_int16_activation_quantization() -> Generator[None, None, None]:
+    """Make TFLite's INT8-with-int16-activations calibration fail fast.
+
+    ``onnx2tf``, when ``output_integer_quantized_tflite=True``, emits four INT8
+    variants: ``_integer_quant``, ``_full_integer_quant``,
+    ``_integer_quant_with_int16_act``, ``_full_integer_quant_with_int16_act``.
+
+    The two int16-activation variants are incompatible with the pseudo-GridSample
+    replacement (see the GridSample replacement kwarg in the ``convert()`` call):
+    pseudo-GridSample emits ``Cast(float→int32)`` ops to index the bilinear
+    gather, and the int16-activation calibrator requires a continuous min/max
+    range on every intermediate tensor. The ``Cast`` outputs are integer-valued,
+    the calibrator records empty min/max, and quantization aborts with::
+
+        RuntimeError: Max and min for dynamic tensors should be recorded
+        during calibration: ... Empty min/max for tensor ... /Cast
+
+    ``onnx2tf`` catches this and logs a warning, but the *calibration loop
+    itself* still runs the full representative dataset before the error fires.
+    On a Colab CPU runtime this takes long enough to look like a hang. This
+    patch short-circuits the calibration call when ``q_activations_type`` is
+    ``int16``, preserving ``onnx2tf``'s existing warning-and-continue behavior
+    but eliminating the wasted compute.
+
+    The two non-int16 variants (``_integer_quant``, ``_full_integer_quant``)
+    are unaffected and still generate normally.
+    """
+    try:
+        import tensorflow as tf
+        from tensorflow.lite.python import lite as _tf_lite
+    except ImportError:
+        # No TF available — nothing to patch, nothing to skip
+        yield
+        return
+
+    # Locate the method onnx2tf calls. In current TF (>=2.13) it's on
+    # TFLiteConverterBase; older versions had it on TFLiteConverter directly.
+    # Patch whichever exists.
+    target_cls = getattr(_tf_lite, "TFLiteConverterBase", None) or _tf_lite.TFLiteConverter
+    if not hasattr(target_cls, "_quantize"):
+        logger.debug("No _quantize method on TFLiteConverter; int16-activation skip patch is a no-op")
+        yield
+        return
+
+    original = target_cls._quantize
+    int16 = tf.int16
+
+    def _patched_quantize(self, model, q_in_type, q_out_type, q_activations_type, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if q_activations_type == int16:
+            # Mirror the message onnx2tf would log after the slow path fails,
+            # so the user sees the same outcome without the wait.
+            raise RuntimeError(
+                "INT8 quantization with int16 activations skipped: "
+                "incompatible with pseudo-GridSample Cast ops "
+                "(RF-DETR converter optimization)."
+            )
+        return original(self, model, q_in_type, q_out_type, q_activations_type, *args, **kwargs)
+
+    target_cls._quantize = _patched_quantize
+    try:
+        yield
+    finally:
+        target_cls._quantize = original
+
+
 def _load_calibration_images(
     image_dir: Path,
     height: int,
@@ -997,7 +1063,11 @@ def export_tflite(
         # "/segmentation_head/blocks.2/dwconv/Conv/kernel") that contain
         # leading "/" characters which violate the saved_model naming
         # pattern. Enabling signature defs bypasses this restriction.
-        with _numpy_allow_pickle(), _patch_validation_download(str(calib_npy_path)):
+        with (
+            _numpy_allow_pickle(),
+            _patch_validation_download(str(calib_npy_path)),
+            _skip_int16_activation_quantization(),
+        ):
             convert(**kwargs)
 
     try:
