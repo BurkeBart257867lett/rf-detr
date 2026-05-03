@@ -989,7 +989,10 @@ def export_tflite(
             logger.error(f"onnx2tf conversion failed: {first_exc}")
             raise RuntimeError(f"onnx2tf conversion failed: {first_exc}") from first_exc
 
-    primary = output_dir / f"{model_stem}_float32.tflite"
+    # onnx2tf always emits _float32.tflite; INT8 additionally emits _integer_quant.tflite.
+    # Return the most specific file for the requested quantization.
+    expected_name = f"{model_stem}_integer_quant.tflite" if quantization == "int8" else f"{model_stem}_float32.tflite"
+    primary = output_dir / expected_name
 
     if not primary.is_file():
         # Fallback: look for any .tflite file produced from this specific ONNX stem.
@@ -998,7 +1001,7 @@ def export_tflite(
         tflite_files = sorted(output_dir.glob(f"{model_stem}_*.tflite"))
         if tflite_files:
             primary = tflite_files[0]
-            logger.info(f"Expected {model_stem}_float32.tflite not found; using {primary.name} instead.")
+            logger.info(f"Expected {expected_name} not found; using {primary.name} instead.")
         else:
             raise RuntimeError(
                 f"onnx2tf completed but no .tflite file matching '{model_stem}_*.tflite' was found in {output_dir}"

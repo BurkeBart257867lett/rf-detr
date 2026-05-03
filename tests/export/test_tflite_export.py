@@ -271,9 +271,27 @@ class TestExportTfliteConverter:
         fake_onnx2tf: Any,
         mock_prepare_calib: Any,
     ) -> None:
+        """INT8 export passes output_integer_quantized_tflite=True to onnx2tf."""
         _, convert_mock = fake_onnx2tf
         export_tflite(onnx_model, tflite_output, quantization="int8")
         assert convert_mock.call_args.kwargs["output_integer_quantized_tflite"] is True
+
+    def test_int8_returns_integer_quant_path(
+        self,
+        onnx_model: Path,
+        tmp_path: Path,
+        fake_onnx2tf: Any,
+        mock_prepare_calib: Any,
+    ) -> None:
+        """INT8 export returns _integer_quant.tflite, not _float32.tflite."""
+        out = tmp_path / "int8_out"
+        out.mkdir()
+        (out / f"{onnx_model.stem}_float32.tflite").write_bytes(b"fp32")
+        (out / f"{onnx_model.stem}_integer_quant.tflite").write_bytes(b"int8")
+
+        result = export_tflite(onnx_model, out, quantization="int8")
+
+        assert result.name == f"{onnx_model.stem}_integer_quant.tflite"
 
     def test_verbosity_forwarded(
         self,
