@@ -1038,3 +1038,58 @@ class TestCheckOnnx2tfAvailable:
         with mock.patch.dict(sys.modules, {"onnx2tf": None}):
             with pytest.raises(ImportError, match="onnx2tf is not installed"):
                 _check_onnx2tf_available()
+
+
+# ---------------------------------------------------------------------------
+# TestGridSampleKwargDetection
+# ---------------------------------------------------------------------------
+
+
+class TestGridSampleKwargDetection:
+    """Tests for runtime detection of the onnx2tf GridSample replacement kwarg."""
+
+    def test_kwarg_is_detected_when_present(self) -> None:
+        """Detected kwarg name must contain both 'grid' and 'pseudo'."""
+        from rfdetr.export._tflite.converter import _GRIDSAMPLE_KWARG
+
+        if _GRIDSAMPLE_KWARG is not None:
+            lower = _GRIDSAMPLE_KWARG.lower()
+            assert "grid" in lower
+            assert "pseudo" in lower
+
+    def test_detection_does_not_raise_on_import(self) -> None:
+        """Module import must succeed regardless of installed onnx2tf version."""
+        import rfdetr.export._tflite.converter  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# TestGridSampleKwargForwarded
+# ---------------------------------------------------------------------------
+
+
+class TestGridSampleKwargForwarded:
+    """Tests that the detected GridSample kwarg is forwarded to onnx2tf.convert."""
+
+    def test_gridsample_kwarg_in_convert_call(
+        self,
+        onnx_model: Path,
+        tflite_output: Path,
+        fake_onnx2tf: Any,
+        mock_prepare_calib: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GridSample replacement kwarg must appear in kwargs forwarded to convert().
+
+        Uses a synthetic kwarg name so the test runs regardless of installed
+        onnx2tf version.  The injection logic is what matters here.
+        """
+        from rfdetr.export._tflite import converter as conv_mod
+
+        test_kwarg = "replace_GridSample_to_pseudo_GridSample"
+        monkeypatch.setattr(conv_mod, "_GRIDSAMPLE_KWARG", test_kwarg)
+
+        _, convert_mock = fake_onnx2tf
+        export_tflite(onnx_model, tflite_output)
+
+        convert_mock.assert_called_once()
+        assert convert_mock.call_args.kwargs[test_kwarg] is True

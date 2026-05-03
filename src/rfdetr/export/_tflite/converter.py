@@ -60,6 +60,7 @@ Note:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import sys
 from itertools import cycle
@@ -92,6 +93,30 @@ _IMAGENET_STD_RGB: tuple[float, float, float] = (0.229, 0.224, 0.225)
 # Keep the legacy 3-channel arrays for any internal callers that reference them.
 _IMAGENET_MEAN: NDArray[np.float32] = np.array(_IMAGENET_MEAN_RGB, dtype=np.float32)
 _IMAGENET_STD: NDArray[np.float32] = np.array(_IMAGENET_STD_RGB, dtype=np.float32)
+
+
+# Detect onnx2tf's GridSample replacement kwarg at import time so it can be
+# forwarded to convert().  Kwarg name has drifted across onnx2tf versions; we
+# match any parameter containing both "grid" and "pseudo" (case-insensitive).
+# Workaround for onnx2tf#274 — onnx2tf's GridSample lowering produces values
+# that diverge from ONNX while onnx2tf's own elementwise-close validator
+# silently passes.  RF-DETR's deformable cross-attention uses F.grid_sample
+# once per decoder layer; without this replacement, top-1 detection scores
+# collapse from ~0.6 to ~0.02.
+def _detect_gridsample_kwarg() -> str | None:
+    """Return the onnx2tf GridSample replacement kwarg name, or None if absent."""
+    try:
+        from onnx2tf import convert as _c
+
+        return next(
+            (name for name in inspect.signature(_c).parameters if "grid" in name.lower() and "pseudo" in name.lower()),
+            None,
+        )
+    except ImportError:
+        return None
+
+
+_GRIDSAMPLE_KWARG: str | None = _detect_gridsample_kwarg()
 
 
 def _imagenet_stats_for_channels(
@@ -943,6 +968,17 @@ def export_tflite(
 
     if quantization == "int8":
         convert_kwargs["output_integer_quantized_tflite"] = True
+
+    if _GRIDSAMPLE_KWARG is not None:
+        convert_kwargs[_GRIDSAMPLE_KWARG] = True
+        logger.debug(f"Enabling onnx2tf GridSample replacement: {_GRIDSAMPLE_KWARG}=True")
+    else:
+        logger.warning(
+            "Installed onnx2tf has no GridSample replacement kwarg. "
+            "If the exported TFLite model produces low-confidence detections, "
+            "this is likely onnx2tf#274 and you should pin onnx2tf to a version "
+            "that supports the replacement (e.g. onnx2tf<2.4)."
+        )
 
     def _run_convert(kwargs: dict[str, Any]) -> None:
         # _patch_validation_download redirects onnx2tf's
