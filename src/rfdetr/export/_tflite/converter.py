@@ -175,15 +175,252 @@ def _fold_constant_expands(model: Any) -> Any:
     return model
 
 
+def _replace_gelu_erf_with_tanh_approx(model: Any) -> Any:
+    """Replace Erf-based GELU nodes with a tanh-GELU approximation.
+
+    ``onnx2tf`` 1.x converts ONNX ``Erf`` nodes to ``FlexErf`` (a Select TF
+    op).  ``FlexErf`` requires the Flex delegate, which is absent from the
+    standard ``tflite_runtime`` wheel.  Additionally, some ``onnx2tf``
+    versions auto-detect the GELU pattern and apply a substitution that
+    produces incorrect activations.  Both issues are eliminated by replacing
+    the 12 Erf-based GELU subgraphs in the DINOv2 backbone before ``onnx2tf``
+    ever sees them.
+
+    The Erf-GELU pattern is:
+
+    .. code-block:: text
+
+        x ──► Div(x, √2) ──► Erf ──► Add(erf_out, 1) ──► Mul(x, add_out)
+                                                           ──► Mul(mul_out, 0.5) ──► output
+
+    It is replaced with the tanh-GELU approximation
+    ``x * 0.5 * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))``:
+
+    .. code-block:: text
+
+        x ──► Mul(x, x) ──► Mul(x², x) ──► Mul(x³, 0.044715)
+          ──► Add(x, scaled_x3) ──► Mul(sum, √(2/π)) ──► Tanh
+          ──► Add(tanh_out, 1) ──► Mul(x, add_out) ──► Mul(mul_out, 0.5) ──► output
+
+    ``Tanh`` is a built-in TFLite op available in all runtimes without any
+    Flex delegate.  The maximum absolute error vs. exact GELU is ~0.0002,
+    well within model tolerance (the original Erf-GELU used by PyTorch has
+    no approximation error at float32 precision, but the tanh approximation
+    difference is smaller than float16 quantization noise).
+
+    Shared scalar initializers (``tanh_gelu_coeff``, ``tanh_gelu_scale``,
+    ``tanh_gelu_one``, ``tanh_gelu_half``) are added once and reused by all
+    replaced subgraphs.
+
+    Args:
+        model: An ONNX ``ModelProto`` to patch in place.
+
+    Returns:
+        The same ``ModelProto`` with all Erf-based GELU subgraphs replaced.
+    """
+    import math
+
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    # Shared scalar initializers — added once, reused by all 12 GELU replacements.
+    tanh_gelu_coeff = np.float32(0.044715)
+    tanh_gelu_scale = np.float32(math.sqrt(2.0 / math.pi))  # ≈ 0.7978845608
+    tanh_gelu_one = np.float32(1.0)
+    tanh_gelu_half = np.float32(0.5)
+    shared_inits = {
+        "__tanh_gelu_coeff__": tanh_gelu_coeff,
+        "__tanh_gelu_scale__": tanh_gelu_scale,
+        "__tanh_gelu_one__": tanh_gelu_one,
+        "__tanh_gelu_half__": tanh_gelu_half,
+    }
+    existing_init_names = {init.name for init in model.graph.initializer}
+    for name, val in shared_inits.items():
+        if name not in existing_init_names:
+            model.graph.initializer.append(numpy_helper.from_array(np.array(val, dtype=np.float32), name=name))
+
+    # ---- Scan for the 5-node Erf-GELU pattern --------------------------------
+    # Pattern (in order):
+    #   Div(x, sqrt2_const)        → erf_input
+    #   Erf(erf_input)             → erf_out
+    #   Add(erf_out, 1.0_const)    → add_out
+    #   Mul(x, add_out)            → mul1_out
+    #   Mul(mul1_out, 0.5_const)   → gelu_out
+    #
+    # We identify patterns by walking from every Erf node backward/forward.
+
+    # Map: output_name → node
+    output_to_node: dict[str, Any] = {}
+    for node in model.graph.node:
+        for out in node.output:
+            output_to_node[out] = node
+
+    # Map: input_name → list of nodes that consume it
+    input_to_nodes: dict[str, list[Any]] = {}
+    for node in model.graph.node:
+        for inp in node.input:
+            input_to_nodes.setdefault(inp, []).append(node)
+
+    init_values: dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in model.graph.initializer}
+
+    def _is_scalar_close(name: str, value: float) -> bool:
+        """Return True if tensor *name* is a scalar initializer ≈ *value*."""
+        if name not in init_values:
+            return False
+        arr = init_values[name]
+        return arr.size == 1 and abs(float(arr.flat[0]) - value) < 1e-4
+
+    nodes_to_remove: list[Any] = []
+    new_nodes: list[Any] = []
+    replacements = 0
+
+    for node in list(model.graph.node):
+        if node.op_type != "Erf":
+            continue
+
+        erf_input = node.input[0]
+        erf_out = node.output[0]
+
+        # Erf input must come from a Div node
+        div_node = output_to_node.get(erf_input)
+        if div_node is None or div_node.op_type != "Div":
+            continue
+
+        # Div: inputs are (x, sqrt2); sqrt2 ≈ 1.4142
+        div_inputs = list(div_node.input)
+        if len(div_inputs) != 2 or not _is_scalar_close(div_inputs[1], math.sqrt(2.0)):
+            continue
+        gelu_input = div_inputs[0]  # the original x fed to GELU
+
+        # Add(erf_out, 1.0) must consume erf_out
+        add_consumers = [n for n in input_to_nodes.get(erf_out, []) if n.op_type == "Add"]
+        if len(add_consumers) != 1:
+            continue
+        add_node = add_consumers[0]
+        add_inputs = list(add_node.input)
+        # one input is erf_out, other must be scalar 1.0
+        one_input = next((inp for inp in add_inputs if inp != erf_out), None)
+        if one_input is None or not _is_scalar_close(one_input, 1.0):
+            continue
+        add_out = add_node.output[0]
+
+        # Mul(x, add_out): one input is gelu_input, other is add_out
+        mul1_consumers = [n for n in input_to_nodes.get(add_out, []) if n.op_type == "Mul"]
+        if len(mul1_consumers) != 1:
+            continue
+        mul1_node = mul1_consumers[0]
+        mul1_inputs = list(mul1_node.input)
+        if gelu_input not in mul1_inputs:
+            continue
+        mul1_out = mul1_node.output[0]
+
+        # Mul(mul1_out, 0.5): one input is mul1_out
+        mul2_consumers = [n for n in input_to_nodes.get(mul1_out, []) if n.op_type == "Mul"]
+        if len(mul2_consumers) != 1:
+            continue
+        mul2_node = mul2_consumers[0]
+        mul2_inputs = list(mul2_node.input)
+        half_input = next((inp for inp in mul2_inputs if inp != mul1_out), None)
+        if half_input is None or not _is_scalar_close(half_input, 0.5):
+            continue
+        gelu_out = mul2_node.output[0]  # final output of the GELU subgraph
+
+        # ---- Pattern matched — build tanh-GELU replacement ------------------
+        uid = str(replacements)
+        x2_name = f"__tanh_gelu_x2_{uid}__"
+        x3_name = f"__tanh_gelu_x3_{uid}__"
+        scaled_x3_name = f"__tanh_gelu_scaled_x3_{uid}__"
+        inner_name = f"__tanh_gelu_inner_{uid}__"
+        scaled_name = f"__tanh_gelu_scaled_{uid}__"
+        tanh_name = f"__tanh_gelu_tanh_{uid}__"
+        tanh_p1_name = f"__tanh_gelu_tanh_p1_{uid}__"
+        x_tanh_p1_name = f"__tanh_gelu_x_tanh_p1_{uid}__"
+        # final output tensor reuses gelu_out so downstream graph is unchanged
+
+        new_nodes.extend(
+            [
+                helper.make_node("Mul", [gelu_input, gelu_input], [x2_name]),
+                helper.make_node("Mul", [x2_name, gelu_input], [x3_name]),
+                helper.make_node("Mul", [x3_name, "__tanh_gelu_coeff__"], [scaled_x3_name]),
+                helper.make_node("Add", [gelu_input, scaled_x3_name], [inner_name]),
+                helper.make_node("Mul", [inner_name, "__tanh_gelu_scale__"], [scaled_name]),
+                helper.make_node("Tanh", [scaled_name], [tanh_name]),
+                helper.make_node("Add", [tanh_name, "__tanh_gelu_one__"], [tanh_p1_name]),
+                helper.make_node("Mul", [gelu_input, tanh_p1_name], [x_tanh_p1_name]),
+                helper.make_node("Mul", [x_tanh_p1_name, "__tanh_gelu_half__"], [gelu_out]),
+            ]
+        )
+
+        nodes_to_remove.extend([div_node, node, add_node, mul1_node, mul2_node])
+        replacements += 1
+
+    for node in nodes_to_remove:
+        try:
+            model.graph.node.remove(node)
+        except ValueError:
+            pass  # already removed (shared node across two patterns — unlikely but safe)
+
+    model.graph.node.extend(new_nodes)
+
+    # Topologically sort all nodes (Kahn's algorithm) so that onnx2tf —
+    # which assumes topological order — can process the patched graph.
+    # Initializer names and graph input names are "already defined" at t=0.
+    defined: set[str] = set()
+    defined.update(init.name for init in model.graph.initializer)
+    defined.update(inp.name for inp in model.graph.input)
+    # Constant nodes (no inputs) are also implicitly defined.
+    remaining = list(model.graph.node)
+    sorted_nodes: list[Any] = []
+    max_passes = len(remaining) + 1
+    for _ in range(max_passes):
+        if not remaining:
+            break
+        ready = [n for n in remaining if all(i == "" or i in defined for i in n.input)]
+        if not ready:
+            # Cycle or truly unresolvable; keep remaining order as-is.
+            sorted_nodes.extend(remaining)
+            remaining = []
+            break
+        for n in ready:
+            sorted_nodes.append(n)
+            defined.update(n.output)
+            remaining.remove(n)
+    del model.graph.node[:]
+    model.graph.node.extend(sorted_nodes)
+
+    logger.debug(
+        "tanh-GELU replacement: %d Erf-GELU subgraph(s) replaced; %d Erf node(s) remaining",
+        replacements,
+        sum(1 for n in model.graph.node if n.op_type == "Erf"),
+    )
+
+    if replacements > 0:
+        try:
+            onnx.checker.check_model(model)
+        except Exception as exc:
+            logger.warning("ONNX check failed after tanh-GELU replacement: %s", exc)
+
+    return model
+
+
 def _patch_onnx_for_tflite(onnx_path: Path, output_dir: Path) -> Path:
     """Apply targeted ONNX graph patches to work around ``onnx2tf`` 1.x bugs.
 
-    Known bug in ``onnx2tf`` 1.x affecting RF-DETR's DINOv2 backbone:
+    Known bugs in ``onnx2tf`` 1.x affecting RF-DETR's DINOv2 backbone:
 
     * **Constant Expand failure** — onnx2tf cannot lower an ``Expand`` node
       whose input is a raw constant tensor (not a ``Layer`` output) into a
       ``tf_keras.Functional`` model.  Fix: constant-fold all ``Expand`` nodes
       with fully-constant inputs, replacing them with initializers.
+
+    * **Erf/FlexErf** — onnx2tf converts ``Erf`` nodes (used in DINOv2's
+      GELU activations) to ``FlexErf`` Select TF ops.  ``FlexErf`` requires
+      the Flex delegate, absent from ``tflite_runtime``; additionally some
+      onnx2tf versions auto-detect the GELU pattern and apply an incorrect
+      substitution.  Both cause corrupted logits (all negative, scores ≈ 0.01).
+      Fix: replace all 12 Erf-GELU subgraphs with tanh-GELU approximation
+      before conversion.
 
     This is a surgical graph-level patch.  Unlike running ``onnxsim``
     (full constant propagation), it does not alter the backbone embedding
@@ -211,6 +448,7 @@ def _patch_onnx_for_tflite(onnx_path: Path, output_dir: Path) -> Path:
 
     model = onnx.load(str(onnx_path))
     model = _fold_constant_expands(model)
+    model = _replace_gelu_erf_with_tanh_approx(model)
 
     patched_dir = output_dir / "_simplified"
     patched_dir.mkdir(parents=True, exist_ok=True)
