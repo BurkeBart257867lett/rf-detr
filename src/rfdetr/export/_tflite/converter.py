@@ -62,6 +62,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+from itertools import cycle
 from pathlib import Path
 from typing import Any, Generator, cast
 
@@ -84,21 +85,78 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", 
 # Default number of images to sample from a directory for calibration.
 _DEFAULT_DIR_CALIB_SAMPLES: int = 100
 
-_IMAGENET_MEAN: NDArray[np.float32] = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD: NDArray[np.float32] = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# RGB ImageNet statistics — cycled for models with != 3 channels.
+_IMAGENET_MEAN_RGB: tuple[float, float, float] = (0.485, 0.456, 0.406)
+_IMAGENET_STD_RGB: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+# Keep the legacy 3-channel arrays for any internal callers that reference them.
+_IMAGENET_MEAN: NDArray[np.float32] = np.array(_IMAGENET_MEAN_RGB, dtype=np.float32)
+_IMAGENET_STD: NDArray[np.float32] = np.array(_IMAGENET_STD_RGB, dtype=np.float32)
+
+
+def _imagenet_stats_for_channels(
+    num_channels: int,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Return per-channel (mean, std) arrays cycled from the RGB ImageNet stats.
+
+    Mirrors ``RFDETR.__init__`` (``detr.py:226-230``) so calibration data is
+    normalised with exactly the statistics the trained model expects.  For a
+    3-channel model the result is the standard RGB ImageNet mean/std.  For a
+    1-channel grayscale model only the red-channel value is used.  For models
+    with more than 3 channels the RGB triplet is repeated cyclically.
+
+    Args:
+        num_channels: Number of input channels ``C`` in the NHWC calibration
+            array.  Must be a positive integer.
+
+    Returns:
+        A tuple ``(mean, std)`` where each element is a float32 NumPy array
+        of length *num_channels*.
+
+    Examples:
+        >>> mean, std = _imagenet_stats_for_channels(1)
+        >>> float(mean[0])
+        0.485...
+        >>> mean, std = _imagenet_stats_for_channels(3)
+        >>> mean.tolist()
+        [0.485..., 0.456..., 0.406...]
+    """
+    mean = np.array(
+        [m for _, m in zip(range(num_channels), cycle(_IMAGENET_MEAN_RGB))],
+        dtype=np.float32,
+    )
+    std = np.array(
+        [s for _, s in zip(range(num_channels), cycle(_IMAGENET_STD_RGB))],
+        dtype=np.float32,
+    )
+    return mean, std
 
 
 def _imagenet_normalize(calib: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Normalize NHWC calibration data from [0, 1] to ImageNet statistics.
+    """Normalise NHWC calibration data with channel-matched ImageNet stats.
+
+    The number of channels is inferred from ``calib.shape[-1]`` and the
+    ImageNet RGB statistics are cycled to match it.  This correctly handles
+    1-channel (grayscale) models, standard 3-channel RGB models, and any
+    other channel count.
 
     Args:
-        calib: Float32 array of shape ``(N, H, W, C)`` with values in ``[0, 1]``.
+        calib: Float32 array of shape ``(N, H, W, C)`` with values in
+            ``[0, 1]``.
 
     Returns:
-        Float32 array of the same shape with ImageNet-normalised values
-        (approximately ``[-2.1, 2.6]``).
+        Float32 array of the same shape with ImageNet-normalised values.
+
+    Examples:
+        >>> import numpy as np
+        >>> arr = np.zeros((2, 8, 8, 1), dtype=np.float32)
+        >>> out = _imagenet_normalize(arr)
+        >>> out.shape
+        (2, 8, 8, 1)
     """
-    return (calib - _IMAGENET_MEAN) / _IMAGENET_STD
+    num_channels = calib.shape[-1]
+    mean, std = _imagenet_stats_for_channels(num_channels)
+    return (calib - mean) / std
 
 
 def _fold_constant_expands(model: Any) -> Any:
@@ -263,9 +321,16 @@ def _replace_gelu_erf_with_tanh_approx(model: Any) -> Any:
             input_to_nodes.setdefault(inp, []).append(node)
 
     init_values: dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in model.graph.initializer}
+    # torch.onnx exports small scalars as Constant nodes, not initializers.
+    # Include their outputs so _is_scalar_close matches them correctly.
+    for _cn in model.graph.node:
+        if _cn.op_type == "Constant":
+            for _attr in _cn.attribute:
+                if _attr.name == "value":
+                    init_values[_cn.output[0]] = numpy_helper.to_array(_attr.t)
 
     def _is_scalar_close(name: str, value: float) -> bool:
-        """Return True if tensor *name* is a scalar initializer ≈ *value*."""
+        """Return True if tensor *name* is a scalar initializer or Constant node output ≈ *value*."""
         if name not in init_values:
             return False
         arr = init_values[name]
@@ -449,6 +514,13 @@ def _patch_onnx_for_tflite(onnx_path: Path, output_dir: Path) -> Path:
     model = onnx.load(str(onnx_path))
     model = _fold_constant_expands(model)
     model = _replace_gelu_erf_with_tanh_approx(model)
+    remaining_erf = sum(1 for n in model.graph.node if n.op_type == "Erf")
+    if remaining_erf != 0:
+        raise RuntimeError(
+            f"GELU patch incomplete: {remaining_erf} Erf node(s) remain. "
+            "The ONNX graph may use Mul(x, 1/sqrt(2)) instead of Div(x, sqrt(2)) — "
+            "inspect and extend the matcher in _replace_gelu_erf_with_tanh_approx."
+        )
 
     patched_dir = output_dir / "_simplified"
     patched_dir.mkdir(parents=True, exist_ok=True)
@@ -556,23 +628,27 @@ def _load_calibration_images(
     image_dir: Path,
     height: int,
     width: int,
+    channels: int = 3,
     max_images: int = _DEFAULT_DIR_CALIB_SAMPLES,
 ) -> NDArray[np.float32]:
     """Load images from a directory and prepare them for calibration.
 
-    Images are loaded, resized to ``(height, width)``, converted to
-    ``float32`` in ``[0, 1]``, and stacked into an NHWC array.
+    Images are loaded, resized to ``(height, width)`` with BILINEAR resampling
+    (matching ``_run_inference``), converted to ``float32`` in ``[0, 1]``, and
+    stacked into an NHWC array.
 
     Args:
         image_dir: Directory containing image files (JPEG, PNG, etc.).
         height: Target image height matching the model input.
         width: Target image width matching the model input.
+        channels: Number of channels the model expects.  Use ``1`` for
+            grayscale models (images are opened as ``"L"``), ``3`` for RGB.
         max_images: Maximum number of images to load.  Files are sorted
             alphabetically and the first *max_images* are used.
 
     Returns:
-        A ``float32`` NumPy array of shape ``(N, height, width, 3)`` with
-        pixel values in ``[0, 1]``.
+        A ``float32`` NumPy array of shape ``(N, height, width, channels)``
+        with pixel values in ``[0, 1]``.
 
     Raises:
         FileNotFoundError: If *image_dir* does not exist or contains no
@@ -593,13 +669,18 @@ def _load_calibration_images(
     image_paths = image_paths[:max_images]
     logger.info(f"Loading {len(image_paths)} calibration images from {image_dir} (resizing to {height}x{width})")
 
+    pil_mode = "L" if channels == 1 else "RGB"
     arrays: list[NDArray[np.float32]] = []
     for img_path in image_paths:
         try:
-            img = Image.open(img_path).convert("RGB").resize((width, height))
-            image_array = np.asarray(img, dtype=np.float32)
-            image_array /= np.float32(255.0)
-            arrays.append(image_array)
+            img = Image.open(img_path).convert(pil_mode).resize((width, height), Image.Resampling.BILINEAR)
+            arr = np.asarray(img, dtype=np.float32) / np.float32(255.0)
+            if arr.ndim == 2:  # L-mode → (H, W); add channel axis
+                arr = arr[:, :, np.newaxis]
+            if arr.shape[-1] != channels:
+                logger.debug("Skipping %s: %d channels, model expects %d", img_path, arr.shape[-1], channels)
+                continue
+            arrays.append(arr)
         except Exception:
             logger.debug(f"Skipping unreadable image: {img_path}")
             continue
@@ -704,6 +785,14 @@ def _prepare_calibration_data(
         np.save(str(npy_path), calib)
         logger.debug(f"Generated random calibration data: shape={calib.shape}, saved to {npy_path}")
     elif isinstance(calibration_data, np.ndarray):
+        _, input_dims = _get_onnx_input_info(onnx_path)
+        _, model_c, _, _ = input_dims
+        if calibration_data.ndim != 4 or calibration_data.shape[-1] != model_c:
+            raise ValueError(
+                f"calibration_data has shape {calibration_data.shape}; model expects "
+                f"NHWC with last dim == {model_c}. For a 1-channel model, "
+                f"pass an array of shape (N, H, W, 1)."
+            )
         npy_path = output_dir / "_rfdetr_calib_data.npy"
         norm_calib = _imagenet_normalize(calibration_data.astype(np.float32, copy=False))
         np.save(str(npy_path), norm_calib)
@@ -714,14 +803,22 @@ def _prepare_calibration_data(
             # Directory of images — load, resize, and convert.
             _, input_dims = _get_onnx_input_info(onnx_path)
             _, _c, h, w = input_dims
-            calib = _load_calibration_images(data_path, height=h, width=w, max_images=max_images)
+            calib = _load_calibration_images(data_path, height=h, width=w, channels=_c, max_images=max_images)
             calib = _imagenet_normalize(calib)
             npy_path = output_dir / "_rfdetr_calib_data.npy"
             np.save(str(npy_path), calib)
             logger.info(f"Prepared calibration data from image directory: shape={calib.shape}, saved to {npy_path}")
         elif data_path.is_file():
-            npy_path = output_dir / "_rfdetr_calib_data.npy"
+            _, input_dims = _get_onnx_input_info(onnx_path)
+            _, model_c, _, _ = input_dims
             _loaded = np.load(str(data_path), allow_pickle=False).astype(np.float32, copy=False)
+            if _loaded.ndim != 4 or _loaded.shape[-1] != model_c:
+                raise ValueError(
+                    f"calibration_data file has shape {_loaded.shape}; model expects "
+                    f"NHWC with last dim == {model_c}. For a 1-channel model, "
+                    f"pass an array of shape (N, H, W, 1)."
+                )
+            npy_path = output_dir / "_rfdetr_calib_data.npy"
             np.save(str(npy_path), _imagenet_normalize(_loaded))
             logger.info(f"Using calibration data from: {data_path}")
         else:

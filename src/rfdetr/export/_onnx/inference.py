@@ -48,8 +48,10 @@ def _create_onnx_session(model_path: str | Path) -> Any:
         ImportError: If ``onnxruntime`` is not installed.
 
     Examples:
-        >>> sess = _create_onnx_session("model.onnx")  # doctest: +SKIP
-        >>> print(sess.get_inputs()[0].name)  # doctest: +SKIP
+        .. code-block:: python
+
+            sess = _create_onnx_session("model.onnx")
+            print(sess.get_inputs()[0].name)
     """
     try:
         import onnxruntime as ort
@@ -105,9 +107,11 @@ def _run_onnx_inference(
         at its original resolution.
 
     Examples:
-        >>> sess = _create_onnx_session("model.onnx")  # doctest: +SKIP
-        >>> dets, img = _run_onnx_inference(sess, "photo.jpg", threshold=0.3)  # doctest: +SKIP
-        >>> print(dets.confidence)  # doctest: +SKIP
+        .. code-block:: python
+
+            sess = _create_onnx_session("model.onnx")
+            dets, img = _run_onnx_inference(sess, "photo.jpg", threshold=0.3)
+            print(dets.confidence)
     """
     inputs = session.get_inputs()
     outputs = session.get_outputs()

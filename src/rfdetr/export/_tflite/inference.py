@@ -101,9 +101,11 @@ def _run_inference(
         at its original resolution.
 
     Examples:
-        >>> interp = _create_interpreter("model_float32.tflite")  # doctest: +SKIP
-        >>> dets, img = _run_inference(interp, "photo.jpg", threshold=0.3)  # doctest: +SKIP
-        >>> print(dets.confidence)  # doctest: +SKIP
+        .. code-block:: python
+
+            interp = _create_interpreter("model_float32.tflite")
+            dets, img = _run_inference(interp, "photo.jpg", threshold=0.3)
+            print(dets.confidence)
     """
     inp_det = interp.get_input_details()
     out_det = interp.get_output_details()

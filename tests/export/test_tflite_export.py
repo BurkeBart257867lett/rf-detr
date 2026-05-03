@@ -883,6 +883,126 @@ class TestLoadCalibrationImages:
         assert ".jpg" in _IMAGE_EXTENSIONS
         assert ".png" in _IMAGE_EXTENSIONS
 
+    @pytest.mark.parametrize(
+        "channels, pil_mode",
+        [
+            pytest.param(1, "L", id="grayscale"),
+            pytest.param(3, "RGB", id="rgb"),
+        ],
+    )
+    def test_channels_parameter_preserved(self, tmp_path: Path, channels: int, pil_mode: str) -> None:
+        """Output last dim equals requested channel count for PIL-loadable modes (L=1, RGB=3)."""
+        from PIL import Image
+
+        for i in range(3):
+            Image.new(pil_mode, (32, 32), color=(i * 40) % 256).save(tmp_path / f"img_{i}.png")
+
+        result = _load_calibration_images(tmp_path, height=16, width=16, channels=channels)
+        assert result.shape[-1] == channels
+        assert result.dtype == np.float32
+
+    def test_grayscale_adds_channel_axis(self, tmp_path: Path) -> None:
+        """L-mode images produce (N, H, W, 1) output, not (N, H, W)."""
+        from PIL import Image
+
+        for i in range(3):
+            Image.new("L", (32, 32), color=i * 80).save(tmp_path / f"gray_{i}.png")
+
+        result = _load_calibration_images(tmp_path, height=16, width=16, channels=1)
+        assert result.shape == (3, 16, 16, 1)
+
+
+# ---------------------------------------------------------------------------
+# TestImagenetNormalizeChannels
+# ---------------------------------------------------------------------------
+
+
+class TestImagenetNormalizeChannels:
+    """Tests for channel-aware ``_imagenet_normalize``."""
+
+    @pytest.mark.parametrize("num_channels", [1, 2, 3, 4, 5])
+    def test_preserves_channel_count(self, num_channels: int) -> None:
+        """Output shape[-1] equals input shape[-1] for any channel count."""
+        arr = np.zeros((2, 8, 8, num_channels), dtype=np.float32)
+        out = _imagenet_normalize(arr)
+        assert out.shape == arr.shape
+        assert out.shape[-1] == num_channels
+
+    def test_three_channel_matches_legacy_stats(self) -> None:
+        """3-channel normalization produces exactly the legacy ImageNet values."""
+        from rfdetr.export._tflite.converter import _IMAGENET_MEAN, _IMAGENET_STD
+
+        arr = np.zeros((1, 4, 4, 3), dtype=np.float32)
+        out = _imagenet_normalize(arr)
+        expected = (arr - _IMAGENET_MEAN) / _IMAGENET_STD
+        np.testing.assert_array_almost_equal(out, expected)
+
+
+# ---------------------------------------------------------------------------
+# TestPrepareCalibrationDataNonRGB (new non-RGB fixtures)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareCalibrationDataNonRGB:
+    """Tests for non-RGB calibration data preparation."""
+
+    @pytest.fixture()
+    def _mock_1ch_onnx(self) -> Generator:
+        """Mock ``_get_onnx_input_info`` to return a 1-channel shape."""
+        with mock.patch(
+            "rfdetr.export._tflite.converter._get_onnx_input_info",
+            return_value=("input", [1, 1, 8, 8]),
+        ):
+            yield
+
+    def test_random_grayscale_saves_correct_shape(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """Random calibration for a 1-channel model produces (N, H, W, 1) npy."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+
+        npy_path = _prepare_calibration_data(onnx_path, None, tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (_DEFAULT_CALIB_SAMPLES, 8, 8, 1)
+        assert data.dtype == np.float32
+
+    def test_ndarray_grayscale_shape_preserved(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """User-supplied (N, H, W, 1) array saves as (N, H, W, 1)."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        calib = np.zeros((4, 8, 8, 1), dtype=np.float32)
+
+        npy_path = _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (4, 8, 8, 1)
+
+    def test_ndarray_channel_mismatch_raises(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """3-channel ndarray passed to a 1-channel model raises ValueError."""
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        calib = np.zeros((4, 8, 8, 3), dtype=np.float32)
+
+        with pytest.raises(ValueError, match="last dim == 1"):
+            _prepare_calibration_data(onnx_path, calib, tmp_path, "fp32")
+
+    def test_directory_grayscale_saves_correct_shape(self, tmp_path: Path, _mock_1ch_onnx: None) -> None:
+        """Directory of L-mode images + 1-channel model → saved (N, H, W, 1) npy."""
+        from PIL import Image
+
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.write_bytes(b"\x00")
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+        for i in range(4):
+            Image.new("L", (16, 16), color=i * 60).save(img_dir / f"gray_{i}.png")
+
+        npy_path = _prepare_calibration_data(onnx_path, str(img_dir), tmp_path, "fp32")
+
+        data = np.load(str(npy_path))
+        assert data.shape == (4, 8, 8, 1)
+        assert data.dtype == np.float32
+
 
 # ---------------------------------------------------------------------------
 # TestCheckOnnx2tfAvailable
