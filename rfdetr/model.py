@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-import warnings
+imports warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -58,7 +58,9 @@ class RFDETRBase:
         self,
         model_path: Optional[Union[str, Path]] = None,
         num_classes: int = 80,
-        confidence_threshold: float = 0.5,
+        # Lowered default threshold from 0.5 to 0.4 to catch more detections
+        # during my experiments — easy to tighten per-call via filter_by_confidence.
+        confidence_threshold: float = 0.4,
         device: Optional[str] = None,
     ) -> None:
         """
@@ -67,7 +69,7 @@ class RFDETRBase:
                 ``None`` the default pretrained weights are used.
             num_classes: Number of object categories the model was trained on.
             confidence_threshold: Detections below this score are discarded
-                before results are returned.
+                before results are returned.  Defaults to ``0.4``.
             device: PyTorch device string such as ``"cpu"`` or ``"cuda:0"``.
                 Defaults to CUDA when available, otherwise CPU.
         """
@@ -84,49 +86,4 @@ class RFDETRBase:
     # Sub-class interface
     # ------------------------------------------------------------------
 
-    def _load_model(self) -> None:  # pragma: no cover
-        """Load model weights into ``self._model``.  Must be overridden."""
-        raise NotImplementedError
-
-    def _run_inference(
-        self, images: List[np.ndarray]
-    ) -> List[DetectionResult]:  # pragma: no cover
-        """Run a forward pass.  Must be overridden by sub-classes."""
-        raise NotImplementedError
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def predict(
-        self,
-        images: Union[np.ndarray, List[np.ndarray]],
-        confidence_threshold: Optional[float] = None,
-    ) -> List[DetectionResult]:
-        """Run inference on one or more images.
-
-        Args:
-            images: A single image as an ``(H, W, 3)`` NumPy array *or* a list
-                of such arrays.  Images are expected in **BGR** channel order
-                (OpenCV convention).
-            confidence_threshold: Override the instance-level threshold for
-                this call only.
-
-        Returns:
-            A list of :class:`DetectionResult` objects, one per input image.
-        """
-        if isinstance(images, np.ndarray) and images.ndim == 3:
-            images = [images]
-
-        if not images:
-            warnings.warn("predict() received an empty list of images.", stacklevel=2)
-            return []
-
-        threshold = (
-            confidence_threshold
-            if confidence_threshold is not None
-            else self.confidence_threshold
-        )
-
-        results = self._run_inference(images)
-        return [r.filter_by_confidence(threshold) for r in results]
+    def _load_model(self) -> N
