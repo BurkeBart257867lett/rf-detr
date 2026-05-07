@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-imports warnings
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -80,10 +80,14 @@ class RFDETRBase:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_path = Path(model_path) if model_path else None
         self._model = None  # populated by _load_model()
+
+        # Log which device we're running on — helpful when switching between
+        # local CPU dev and GPU inference on my remote machine.
+        warnings.warn(
+            f"RFDETRBase: using device '{self.device}'",
+            stacklevel=2,
+        )
+
         self._load_model()
 
-    # ------------------------------------------------------------------
-    # Sub-class interface
-    # ------------------------------------------------------------------
-
-    def _load_model(self) -> N
+    # ------------
