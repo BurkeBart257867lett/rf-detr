@@ -52,6 +52,18 @@ class DetectionResult:
             "class_names": self.class_names,
         }
 
+    def top_k(self, k: int) -> "DetectionResult":
+        """Return a new DetectionResult with only the top-k highest scoring detections."""
+        if k >= len(self):
+            return self
+        indices = np.argsort(self.scores)[::-1][:k]
+        return DetectionResult(
+            boxes=self.boxes[indices],
+            scores=self.scores[indices],
+            labels=self.labels[indices],
+            class_names=self.class_names,
+        )
+
 
 class RFDETRBase:
     """Base class shared by all RF-DETR model variants.
@@ -85,9 +97,4 @@ class RFDETRBase:
         import torch  # local import so the module is importable without torch
 
         self.num_classes = num_classes
-        self.confidence_threshold = confidence_threshold
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_path = Path(model_path) if model_path else None
-        self._model = None  # populated by _load_model()
-
-        # Log which device we're running on — 
+ 
