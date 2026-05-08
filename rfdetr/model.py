@@ -43,6 +43,15 @@ class DetectionResult:
             class_names=self.class_names,
         )
 
+    def to_dict(self) -> dict:
+        """Serialize results to a plain dict — handy for JSON logging."""
+        return {
+            "boxes": self.boxes.tolist(),
+            "scores": self.scores.tolist(),
+            "labels": self.labels.tolist(),
+            "class_names": self.class_names,
+        }
+
 
 class RFDETRBase:
     """Base class shared by all RF-DETR model variants.
@@ -81,13 +90,4 @@ class RFDETRBase:
         self.model_path = Path(model_path) if model_path else None
         self._model = None  # populated by _load_model()
 
-        # Log which device we're running on — helpful when switching between
-        # local CPU dev and GPU inference on my remote machine.
-        warnings.warn(
-            f"RFDETRBase: using device '{self.device}'",
-            stacklevel=2,
-        )
-
-        self._load_model()
-
-    # ------------
+        # Log which device we're running on — 
